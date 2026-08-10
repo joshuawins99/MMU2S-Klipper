@@ -17,11 +17,10 @@ This driver is currently in an early state. Bugs are possible.
     * Cut Length
 * LCD Menus that mimic original Prusa options
 * On screen Filament status
+* Spool Join
 
 ### Currently Unsupported
 * Filament Loading/Unloading retries (should currently just pause print)
-* Filament Runout Detection with FINDA
-* Spool Join
 
 ### Prerequisites
 * Printer running klipper
@@ -55,3 +54,4 @@ mmu_previous_slot = 5
 * MMU_CUT SLOT={0-4}
 * MMU_REG_READ REG_ENTRY={register name}
 * MMU_RESET
+* MMU_SET_SPOOLJOIN ORDER={1,2,3,4,5} ORDER=1,2,3,4,5 syntax most significant first. Setting ORDER=-1 disables spool join

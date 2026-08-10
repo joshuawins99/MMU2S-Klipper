@@ -311,6 +311,7 @@ class MMUFindaSensor:
         self.mmu = mmu
         self.state = False
         self.poll_rate = poll_rate
+        self.enabled = False
 
         self.reactor = printer.get_reactor()
         self.reactor.register_timer(
@@ -327,12 +328,14 @@ class MMUFindaSensor:
 
     def get_status(self, eventtime):
         return {
+            "enabled": self.enabled,
             "filament_detected": self.state
         }
 
 class MMU2S_Klipper:
     def __init__(self, config):
         self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
 
         # Defined variables in klipper instantiation
         port                      = config.get('serial')
@@ -364,6 +367,8 @@ class MMU2S_Klipper:
         self.mmu.request('Q', 0)
         self.mmu.request('Q', 0)
 
+        self.changing_spools = False
+
         if self.mmu_slow_feedrate != 0: # Write register to update slow feedrate of MMU
             self.mmu.write_register(MMU_register_table['pulley_slow_feedrate'], self.mmu_slow_feedrate)
 
@@ -377,6 +382,7 @@ class MMU2S_Klipper:
             self.mmu.write_register(MMU_register_table['cut_length'], self.mmu_cut_length)
 
         gcode = self.printer.lookup_object('gcode')
+
         gcode.register_command('MMU_UNLOAD', self.cmd_MMU_UNLOAD)
         gcode.register_command('MMU_PRELOAD', self.cmd_MMU_PRELOAD)
         gcode.register_command('MMU_STATUS', self.cmd_MMU_STATUS)
@@ -384,14 +390,28 @@ class MMU2S_Klipper:
         gcode.register_command('MMU_CUT', self.cmd_MMU_CUT)
         gcode.register_command('MMU_REG_READ', self.cmd_MMU_REG_READ)
         gcode.register_command('MMU_RESET', self.cmd_MMU_RESET)
+        gcode.register_command('MMU_SET_SPOOLJOIN', self.cmd_MMU_SET_SPOOLJOIN)
 
         self.printer.add_object("filament_switch_sensor MMU_Finda", MMUFindaSensor(self.printer, self.mmu, self.FINDA_poll_rate))
+
+        self.printer.register_event_handler("klippy:ready", self._spooljoin_handler)
+        self.printer.register_event_handler("klippy:ready", self._initialize_vars)
 
         #reactor = self.printer.get_reactor()
         #self._poll_timer = reactor.register_timer(self._poll_mmu)
 
         #self.printer.register_event_handler("klippy:ready", self.handle_ready)
         #self.handle_ready()
+
+    def _initialize_vars(self):
+        self.reactor.register_callback(self._run_initialization_gcode)
+
+    def _run_initialization_gcode(self, eventtime):
+        gcode = self.printer.lookup_object("gcode")
+        gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=0")
+
+    def _spooljoin_handler(self):
+        self.reactor.register_timer(self.spool_join, self.reactor.monotonic() + 0.5)
 
     def handle_ready(self):
         reactor = self.printer.get_reactor()
@@ -415,6 +435,60 @@ class MMU2S_Klipper:
         if is_printing and not pause_resume.is_paused:
             gcode.run_script_from_command("PAUSE")
 
+    def spool_join(self, eventtime):
+        gcode = self.printer.lookup_object("gcode")
+        sv = self.printer.lookup_object("save_variables")
+        reactor = self.printer.get_reactor()
+        print_stats = self.printer.lookup_object("print_stats")
+        spool_join_enable = sv.allVariables.get("mmu_spooljoin_enable", 0)
+        sensor = self.printer.lookup_object("filament_switch_sensor fsensor")
+        self.changing_spools = False
+        next_spool = -1
+
+        if sensor.get_status(reactor.monotonic()).get("filament_detected", False): # Optical sensor is inverted logic
+            return eventtime + 0.5
+
+        if spool_join_enable == 0:
+            return eventtime + 0.5
+        
+        spool_order = sv.allVariables.get("mmu_spooljoin", [])
+        current_slot = sv.allVariables.get("mmu_loaded_slot", -1)
+        is_printing = print_stats.get_status(reactor.monotonic())["state"] == "printing"
+
+        if current_slot == -1 and is_printing: # Shouldn't hit this case
+            gcode.respond_info("MMU: ERROR. Unexpected case hit in spool join function!")
+            return eventtime + 0.5
+
+        if is_printing == False: # Not printing
+            return eventtime + 0.5
+
+        current_slot += 1 # Switch to 1 based counting
+
+        for idx, slot in enumerate(spool_order):
+            if slot == current_slot:
+                if (idx < len(spool_order)-1):
+                    next_spool = spool_order[idx+1]
+                    spool_order[idx] = -1 # Clear Slot
+                    self.save_spooljoin(spool_order) # Save updated spool order
+                    self.changing_spools = True
+                    break
+                else:
+                    gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=0")
+
+        if self.changing_spools == True:
+            gcode.respond_info(f"MMU: Spool {current_slot} empty. Switching to {next_spool}")
+            gcode.run_script_from_command("SAVE_GCODE_STATE NAME=MMU_SPOOL_JOIN")
+            gcode.run_script_from_command("PAUSE")
+            gcode.run_script_from_command("G1 E10 F100")
+            gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_loaded_slot VALUE=5")
+            gcode.run_script_from_command(f"MMU_LOAD SLOT={next_spool-1}") # MMU_LOAD SLOT is 0 based
+            gcode.run_script_from_command("G1 E50 F300")
+            gcode.run_script_from_command("G1 E-1 F300")
+            gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=MMU_SPOOL_JOIN")
+            gcode.run_script_from_command("RESUME")
+        
+        return eventtime + 0.5
+
     def cmd_MMU_LOAD(self, gcmd):
         slot = gcmd.get_int('SLOT')
         gcode = self.printer.lookup_object("gcode")
@@ -433,6 +507,8 @@ class MMU2S_Klipper:
             reactor.pause(reactor.monotonic() + 0.002)
 
         finda_state = self.mmu.read_register_retry(MMU_register_table["FINDA_State"])
+
+        gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=1")
 
         loaded_slot = save_variables.allVariables.get("mmu_loaded_slot", -1)
         if loaded_slot == slot:
@@ -582,6 +658,7 @@ class MMU2S_Klipper:
             gcmd.respond_info("MMU: FINDA probe not activated. Assuming filament not loaded.")
             return
 
+        gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=0")
         gcmd.respond_info(f"MMU: Starting Filament Unload")
 
         feedrate = self.unload_retract_speed * 60.0
@@ -675,7 +752,7 @@ class MMU2S_Klipper:
         gcmd.respond_info(f"MMU: Status -> {status}")
 
     def cmd_MMU_REG_READ(self, gcmd):
-        reg_entry = slot = gcmd.get('REG_ENTRY', "")
+        reg_entry = gcmd.get('REG_ENTRY', "")
         if reg_entry not in MMU_register_table:
             gcmd.respond_info(f"MMU: MMU_REG_READ required REG_ENTRY=reg syntax")
             valid_regs = []
@@ -711,6 +788,7 @@ class MMU2S_Klipper:
         reactor = self.printer.get_reactor()
         self.mmu.request('X', 0)
         gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_changing_slot VALUE=5")
+        gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=0")
         while True:
             status = self.mmu.get_status()
             if status['status'] == 'Finished' or status['value'] == 0:
@@ -736,6 +814,27 @@ class MMU2S_Klipper:
         if self.mmu_cut_length != 0: # Write register to update cut length of MMU
             self.mmu.write_register(MMU_register_table['cut_length'], self.mmu_cut_length)
 
+    def save_spooljoin(self, spool_list):
+        sv = self.printer.lookup_object("save_variables")
+        gcode = self.printer.lookup_object("gcode")
+
+        literal = repr(spool_list)
+        sv_var = gcode.create_gcode_command("SAVE_VARIABLE", "", {"VARIABLE": "mmu_spooljoin", "VALUE": literal})
+        sv.cmd_SAVE_VARIABLE(sv_var)
+
+    def cmd_MMU_SET_SPOOLJOIN(self, gcmd):
+        raw_order = gcmd.get("ORDER", "")
+        if raw_order is None:
+            gcmd.respond_info(f"MMU: MMU_SET_SPOOLJOIN required ORDER=1,2,3,4,5 syntax most significant first")
+            return
+
+        try:
+            spool_list = [int(x.strip()) for x in raw_order.split(",") if x.strip()]
+        except Exception:
+            gcmd.respond_info(f"MMU: MMU_SET_SPOOLJOIN required ORDER=1,2,3,4,5 syntax most significant first")
+            return
+
+        self.save_spooljoin(spool_list)
 # ------------------------------------------------------------
 # Klipper entry point
 # ------------------------------------------------------------
