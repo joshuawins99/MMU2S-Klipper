@@ -346,6 +346,7 @@ class MMU2S_Klipper:
         self.load_extra_pull      = config.getfloat('load_extra_pull', 5.0) # Extra amount to pull filament in after filament detected from a load
         self.load_extra_retract   = config.getfloat('load_extra_retract', -30.0) # Amount to retract filament after extra pull. If extra_pull is 0 then this is ignored. 
         self.load_slow_feedrate   = config.getint('load_slow_feedrate', 0) # Feedrate of the extruder motor to pull filament in. 0 reads MMU register to match it. In mm/s
+        self.load_feedrate_factor = config.getfloat('load_feedrate_factor', 1) # Multiplier for during MMU to extruder handoff
         self.unload_retract_speed = config.getfloat('unload_retract_speed', 20.0) # Initial extruder retraction speed on an unload from extruder
         self.unload_step          = config.getfloat('unload_step', 2.0) # Used as a granularity amount for gcode commands send to extruder motor while waiting for filament sensor to deactivate
         self.unload_max_retract   = config.getfloat('unload_max_retract', 30.0) # Used as a timeout for filament to unload from extruder
@@ -368,6 +369,8 @@ class MMU2S_Klipper:
         self.mmu.request('Q', 0)
 
         self.changing_spools = False
+        self.fail_counter = 0
+        self.max_fail_count = 3
 
         if self.mmu_slow_feedrate != 0: # Write register to update slow feedrate of MMU
             self.mmu.write_register(MMU_register_table['pulley_slow_feedrate'], self.mmu_slow_feedrate)
@@ -477,15 +480,8 @@ class MMU2S_Klipper:
 
         if self.changing_spools == True:
             gcode.respond_info(f"MMU: Spool {current_slot} empty. Switching to {next_spool}")
-            gcode.run_script_from_command("SAVE_GCODE_STATE NAME=MMU_SPOOL_JOIN")
-            gcode.run_script_from_command("PAUSE")
-            gcode.run_script_from_command("G1 E10 F100")
-            gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_loaded_slot VALUE=5")
-            gcode.run_script_from_command(f"MMU_LOAD SLOT={next_spool-1}") # MMU_LOAD SLOT is 0 based
-            gcode.run_script_from_command("G1 E50 F300")
-            gcode.run_script_from_command("G1 E-1 F300")
-            gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=MMU_SPOOL_JOIN")
-            gcode.run_script_from_command("RESUME")
+            gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_next_spool VALUE={next_spool-1}") # MMU_LOAD SLOT is 0 based
+            gcode.run_script_from_command("MMU_SPOOLJOIN_SEQUENCE")
         
         return eventtime + 0.5
 
@@ -548,7 +544,48 @@ class MMU2S_Klipper:
 
         self.gcmd = gcmd
         gcmd.respond_info(f"MMU: Loading Slot {slot}")
-        self._start_loading(gcmd, slot)
+        
+        while self.fail_counter < self.max_fail_count:
+            pass_fail = self._start_loading(gcmd, slot)
+            if pass_fail == False and self.fail_counter == 2:
+                gcode.run_script_from_command(f"MMU_CUT SLOT={slot}")
+            if pass_fail == True:
+                break
+
+    def _filament_sensor_check(self, eventtime):
+        reactor = self.printer.get_reactor()
+        sensor = self.printer.lookup_object("filament_switch_sensor fsensor")
+
+        self._filament_detected = sensor.get_status(eventtime).get("filament_detected", False)
+
+        if self._filament_detected:
+            self.mmu.request('f', 1, wait_for_response=False)
+            self._filament_sensor_triggered = True
+
+        return eventtime + 0.001
+
+    def _check_filament_grab(self, gcmd):
+        reactor = self.printer.get_reactor()
+        gcode = self.printer.lookup_object("gcode")
+        sensor = self.printer.lookup_object("filament_switch_sensor fsensor")
+
+        initial = sensor.get_status(reactor.monotonic()).get("filament_detected", False)
+        self._filament_detected = initial
+
+        # Forward
+        gcode.run_script_from_command("G1 E20 F2000")
+        gcode.run_script_from_command("M400")
+        forward = self._filament_detected
+
+        # Reverse
+        gcode.run_script_from_command("G1 E-10 F2000")
+        gcode.run_script_from_command("M400")
+        reverse = self._filament_detected
+
+        gcmd.respond_info(f"MMU: Grab Test -> initial={initial}, forward={forward}, reverse={reverse}")
+
+        # Filament should have always triggered sensor
+        return (initial and forward and reverse)
 
     def _start_loading(self, gcmd, slot):
         gcode = self.printer.lookup_object("gcode")
@@ -573,14 +610,16 @@ class MMU2S_Klipper:
 
         moved = 0.0
         loading_failed = False
+        self._filament_sensor_triggered = False
+        self._filament_sensor_timer = None
+        self._filament_sensor_timer = reactor.register_timer(self._filament_sensor_check, reactor.monotonic())
         try:
             while moved < self.load_total_distance:
-                if sensor.get_status(reactor.monotonic()).get("filament_detected", False):
-                    gcmd.respond_info( "MMU: Extruder sensor triggered.")
-                    self.mmu.request('f', 1, wait_for_response = False)
-                    if self.load_extra_pull != 0:
-                        gcode.run_script_from_command(f"G1 E{self.load_extra_pull:.3f} F{feedrate:.0f}")
-                        gcode.run_script_from_command(f"G4 P500")
+                if self._filament_sensor_triggered == True:
+                    if self._filament_sensor_timer is not None:
+                        reactor.update_timer(self._filament_sensor_timer, reactor.NEVER)
+                        self._filament_sensor_timer = None
+                    gcode.run_script_from_command(f"G4 P1500")
                     while True: # Wait until completed to finish loading
                         status = self.mmu.get_status()
                         if status['status'] == 'Finished' or status['value'] == 0:
@@ -589,51 +628,60 @@ class MMU2S_Klipper:
                             error_name = MMU_error_table.get(status['value'], f"UNKNOWN_ERROR_0x{status['value']:04X}")
                             gcmd.respond_info(f"MMU: Loading Error -> {error_name}")
                             self._pause_print()
-                            return 
+                            break
                         reactor.pause(reactor.monotonic() + 0.002)
+                    gcode.run_script_from_command(f"G1 E1 F{feedrate:.0f}")
+                    gcode.run_script_from_command(f"M400")
+                    if not self._check_filament_grab(gcmd):
+                        gcmd.respond_info(f"MMU: Loading Error -> Didnt Pass Grab Test")
+                        loading_failed = True
+                        break
                     if self.load_extra_pull != 0:
+                        gcode.run_script_from_command(f"G1 E{self.load_extra_pull:.3f} F{feedrate:.0f}")
+                        gcode.run_script_from_command("M400")
+                    if self.load_extra_retract != 0:
                         gcode.run_script_from_command(f"G1 E{self.load_extra_retract:.3f} F{feedrate:.0f}")
+                        gcode.run_script_from_command("M400")
                     break
-                gcode.run_script_from_command(f"G1 E{self.load_step:.3f} F{feedrate:.0f}")
+                gcode.run_script_from_command(f"G1 E{self.load_step:.3f} F{feedrate*self.load_feedrate_factor:.0f}")
+                #gcode.run_script_from_command("M400")
                 moved += self.load_step
             else:
                 gcmd.respond_info(f"MMU: Filament not detected after {self.load_total_distance} mm.")
-                self._pause_print()
+                #self._pause_print()
                 # Tell MMU filament sensor activated to stop motor grinding
                 self.mmu.request('f', 1)
-                reactor.pause(reactor.monotonic() + 0.002)
-                # Unload filament
-                gcode.run_script_from_command(f"G1 E-10 F120")
-                self.mmu.request('f', 0)
-                reactor.pause(reactor.monotonic() + 0.002)
                 while True:
                     status = self.mmu.get_status()
                     if status['status'] == 'Finished' or status['value'] == 0:
-                        break
-                    reactor.pause(reactor.monotonic() + 0.002)
-                self.mmu.request('U', 0)
-                while True:
-                    status = self.mmu.get_status()
-                    if status['status'] == 'Finished' or status['value'] == 0:
-                        gcmd.respond_info(f"MMU: Unloaded Filament")
                         break
                     if status['status'] == 'Error':
                         error_name = MMU_error_table.get(status['value'], f"UNKNOWN_ERROR_0x{status['value']:04X}")
-                        gcmd.respond_info(f"MMU: Unloading Error -> {error_name}")
-                        return 
+                        gcmd.respond_info(f"MMU: Error -> {error_name}")
+                        break
                     reactor.pause(reactor.monotonic() + 0.002)
                 # Move selector to park slot
-                self.mmu.write_register(MMU_register_table['Set_Get_Selector_slot'], 5)
-                gcmd.respond_info(f"MMU: Print Paused due to loading issue with slot {slot}")
+                #self.mmu.write_register(MMU_register_table['Set_Get_Selector_slot'], 5)
+                #gcmd.respond_info(f"MMU: Print Paused due to loading issue with slot {slot}")
                 loading_failed = True
+
+            if loading_failed == True:
+                self.fail_counter += 1
+                gcode.run_script_from_command(f"MMU_UNLOAD")
+                return False
         finally:
             if loading_failed == False:
+                self.fail_counter = 0
                 gcmd.respond_info(f"MMU: Filament in Slot {slot} loaded")
                 gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_changing_slot VALUE=5")
                 gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_loaded_slot VALUE={slot}")
             else:
                 gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_loaded_slot VALUE=5")
             gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=MMU_LOAD")
+            if loading_failed == False:
+                return True
+            else:
+                return False
 
     def cmd_MMU_UNLOAD(self, gcmd):
         tip_shaping = gcmd.get_int('TIP_SHAPE', 0)
