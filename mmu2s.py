@@ -356,6 +356,7 @@ class MMU2S_Klipper:
         self.mmu_bowden_length    = config.getint('mmu_bowden_length', 0) # Allows for writing MMU register to change bowden_length. 0 means use default
         self.mmu_cut_length       = config.getint('mmu_cut_length', 0) # Allows for writing MMU register to change cut_length. 0 means use default
         self.mmu_restart          = config.getboolean('mmu_restart', True) # Toggles MMU restarting when Klipper initializes
+        self.mmu_cutter           = config.getboolean('mmu_cutter', False) # Toggles use of MMU cutter for loading retries
 
         # Instantiate MMU2S driver
         self.mmu = MMU2S(port=port, baud=baud, timeout=timeout)
@@ -414,7 +415,7 @@ class MMU2S_Klipper:
         gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=0")
 
     def _spooljoin_handler(self):
-        self.reactor.register_timer(self.spool_join, self.reactor.monotonic() + 0.5)
+        self.reactor.register_timer(self.spool_join, self.reactor.monotonic() + 0.25)
 
     def handle_ready(self):
         reactor = self.printer.get_reactor()
@@ -449,10 +450,10 @@ class MMU2S_Klipper:
         next_spool = -1
 
         if sensor.get_status(reactor.monotonic()).get("filament_detected", False): # Optical sensor is inverted logic
-            return eventtime + 0.5
+            return eventtime + 0.25
 
         if spool_join_enable == 0:
-            return eventtime + 0.5
+            return eventtime + 0.25
         
         spool_order = sv.allVariables.get("mmu_spooljoin", [])
         current_slot = sv.allVariables.get("mmu_loaded_slot", -1)
@@ -460,12 +461,10 @@ class MMU2S_Klipper:
 
         if current_slot == -1 and is_printing: # Shouldn't hit this case
             gcode.respond_info("MMU: ERROR. Unexpected case hit in spool join function!")
-            return eventtime + 0.5
+            return eventtime + 0.25
 
         if is_printing == False: # Not printing
-            return eventtime + 0.5
-
-        current_slot += 1 # Switch to 1 based counting
+            return eventtime + 0.25
 
         for idx, slot in enumerate(spool_order):
             if slot == current_slot:
@@ -479,11 +478,11 @@ class MMU2S_Klipper:
                     gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=0")
 
         if self.changing_spools == True:
-            gcode.respond_info(f"MMU: Spool {current_slot} empty. Switching to {next_spool}")
-            gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_next_spool VALUE={next_spool-1}") # MMU_LOAD SLOT is 0 based
+            gcode.respond_info(f"MMU: Slot {current_slot} empty. Switching to slot {next_spool}")
+            gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_next_spool VALUE={next_spool}")
             gcode.run_script_from_command("MMU_SPOOLJOIN_SEQUENCE")
         
-        return eventtime + 0.5
+        return eventtime + 0.25
 
     def cmd_MMU_LOAD(self, gcmd):
         slot = gcmd.get_int('SLOT')
@@ -547,10 +546,19 @@ class MMU2S_Klipper:
         
         while self.fail_counter < self.max_fail_count:
             pass_fail = self._start_loading(gcmd, slot)
-            if pass_fail == False and self.fail_counter == 2:
-                gcode.run_script_from_command(f"MMU_CUT SLOT={slot}")
+            status = self.mmu.get_status()
+            if status['status'] == 'Error':
+                self._pause_print()
+                gcmd.respond_info(f"MMU: Loading attempts failed! Run MMU_RESET to clear error count")
+                return
+            if self.mmu_cutter == True:
+                if pass_fail == False and self.fail_counter == 2:
+                    gcode.run_script_from_command(f"MMU_CUT SLOT={slot}")
             if pass_fail == True:
                 break
+
+        if self.fail_counter >= self.max_fail_count:
+            gcmd.respond_info(f"MMU: Loading attempts failed! Run MMU_RESET to clear error count")
 
     def _filament_sensor_check(self, eventtime):
         reactor = self.printer.get_reactor()
@@ -837,6 +845,7 @@ class MMU2S_Klipper:
         self.mmu.request('X', 0)
         gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_changing_slot VALUE=5")
         gcode.run_script_from_command(f"SAVE_VARIABLE VARIABLE=mmu_spooljoin_enable VALUE=0")
+        self.fail_counter = 0
         while True:
             status = self.mmu.get_status()
             if status['status'] == 'Finished' or status['value'] == 0:
@@ -871,15 +880,15 @@ class MMU2S_Klipper:
         sv.cmd_SAVE_VARIABLE(sv_var)
 
     def cmd_MMU_SET_SPOOLJOIN(self, gcmd):
-        raw_order = gcmd.get("ORDER", "")
-        if raw_order is None:
-            gcmd.respond_info(f"MMU: MMU_SET_SPOOLJOIN required ORDER=1,2,3,4,5 syntax most significant first")
+        raw_order = gcmd.get("ORDER", None)
+        if raw_order is None or raw_order == "":
+            gcmd.respond_info(f"MMU: MMU_SET_SPOOLJOIN required ORDER=0,1,2,3,4 syntax most significant first")
             return
 
         try:
             spool_list = [int(x.strip()) for x in raw_order.split(",") if x.strip()]
         except Exception:
-            gcmd.respond_info(f"MMU: MMU_SET_SPOOLJOIN required ORDER=1,2,3,4,5 syntax most significant first")
+            gcmd.respond_info(f"MMU: MMU_SET_SPOOLJOIN required ORDER=0,1,2,3,4 syntax most significant first")
             return
 
         self.save_spooljoin(spool_list)
