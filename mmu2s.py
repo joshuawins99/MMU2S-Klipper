@@ -338,25 +338,27 @@ class MMU2S_Klipper:
         self.reactor = self.printer.get_reactor()
 
         # Defined variables in klipper instantiation
-        port                      = config.get('serial')
-        baud                      = config.getint('baud', 115200)
-        timeout                   = config.getfloat('timeout', 1.0)
-        self.load_total_distance  = config.getfloat('load_total_distance', 250.0) # Used as a timeout for filament to load between the FINDA and Filament Extruder Sensor
-        self.load_step            = config.getfloat('load_step', 5.0) # Used as a granularity amount for gcode commands send to extruder motor while waiting for filament to arrive
-        self.load_extra_pull      = config.getfloat('load_extra_pull', 5.0) # Extra amount to pull filament in after filament detected from a load
-        self.load_extra_retract   = config.getfloat('load_extra_retract', -30.0) # Amount to retract filament after extra pull. If extra_pull is 0 then this is ignored. 
-        self.load_slow_feedrate   = config.getint('load_slow_feedrate', 0) # Feedrate of the extruder motor to pull filament in. 0 reads MMU register to match it. In mm/s
-        self.load_feedrate_factor = config.getfloat('load_feedrate_factor', 1) # Multiplier for during MMU to extruder handoff
-        self.unload_retract_speed = config.getfloat('unload_retract_speed', 20.0) # Initial extruder retraction speed on an unload from extruder
-        self.unload_step          = config.getfloat('unload_step', 2.0) # Used as a granularity amount for gcode commands send to extruder motor while waiting for filament sensor to deactivate
-        self.unload_max_retract   = config.getfloat('unload_max_retract', 30.0) # Used as a timeout for filament to unload from extruder
-        self.FINDA_poll_rate      = config.getfloat('FINDA_poll_rate', 1) # Polling rate of FINDA probe
-        self.mmu_slow_feedrate    = config.getint('mmu_slow_feedrate', 0) # Allows for writing MMU register to change slow_feedrate. 0 means use default
-        self.mmu_load_feedrate    = config.getint('mmu_load_feedrate', 0) # Allows for writing MMU register to change load_feedrate. 0 means use default
-        self.mmu_bowden_length    = config.getint('mmu_bowden_length', 0) # Allows for writing MMU register to change bowden_length. 0 means use default
-        self.mmu_cut_length       = config.getint('mmu_cut_length', 0) # Allows for writing MMU register to change cut_length. 0 means use default
-        self.mmu_restart          = config.getboolean('mmu_restart', True) # Toggles MMU restarting when Klipper initializes
-        self.mmu_cutter           = config.getboolean('mmu_cutter', False) # Toggles use of MMU cutter for loading retries
+        port                            = config.get('serial')
+        baud                            = config.getint('baud', 115200)
+        timeout                         = config.getfloat('timeout', 1.0)
+        self.load_total_distance        = config.getfloat('load_total_distance', 250.0) # Used as a timeout for filament to load between the FINDA and Filament Extruder Sensor
+        self.load_step                  = config.getfloat('load_step', 5.0) # Used as a granularity amount for gcode commands send to extruder motor while waiting for filament to arrive
+        self.load_extra_pull            = config.getfloat('load_extra_pull', 5.0) # Extra amount to pull filament in after filament detected from a load
+        self.load_extra_retract         = config.getfloat('load_extra_retract', -30.0) # Amount to retract filament after extra pull. If extra_pull is 0 then this is ignored. 
+        self.load_slow_feedrate         = config.getint('load_slow_feedrate', 0) # Feedrate of the extruder motor to pull filament in. 0 reads MMU register to match it. In mm/s
+        self.load_feedrate_factor       = config.getfloat('load_feedrate_factor', 1) # Multiplier for during MMU to extruder handoff
+        self.load_grab_forward_distance = config.getfloat('load_grab_forward_distance', 20.0) # Distance to pull the filament in for the grab test
+        self.load_grab_reverse_distance = config.getfloat('load_grab_reverse_distance', -12.0) # Distance to retract the filament out for the grab test
+        self.unload_retract_speed       = config.getfloat('unload_retract_speed', 20.0) # Initial extruder retraction speed on an unload from extruder
+        self.unload_step                = config.getfloat('unload_step', 2.0) # Used as a granularity amount for gcode commands send to extruder motor while waiting for filament sensor to deactivate
+        self.unload_max_retract         = config.getfloat('unload_max_retract', 30.0) # Used as a timeout for filament to unload from extruder
+        self.FINDA_poll_rate            = config.getfloat('FINDA_poll_rate', 1) # Polling rate of FINDA probe
+        self.mmu_slow_feedrate          = config.getint('mmu_slow_feedrate', 0) # Allows for writing MMU register to change slow_feedrate. 0 means use default
+        self.mmu_load_feedrate          = config.getint('mmu_load_feedrate', 0) # Allows for writing MMU register to change load_feedrate. 0 means use default
+        self.mmu_bowden_length          = config.getint('mmu_bowden_length', 0) # Allows for writing MMU register to change bowden_length. 0 means use default
+        self.mmu_cut_length             = config.getint('mmu_cut_length', 0) # Allows for writing MMU register to change cut_length. 0 means use default
+        self.mmu_restart                = config.getboolean('mmu_restart', True) # Toggles MMU restarting when Klipper initializes
+        self.mmu_cutter                 = config.getboolean('mmu_cutter', False) # Toggles use of MMU cutter for loading retries
 
         # Instantiate MMU2S driver
         self.mmu = MMU2S(port=port, baud=baud, timeout=timeout)
@@ -581,12 +583,12 @@ class MMU2S_Klipper:
         self._filament_detected = initial
 
         # Forward
-        gcode.run_script_from_command("G1 E20 F2000")
+        gcode.run_script_from_command(f"G1 E{self.load_grab_forward_distance} F2000")
         gcode.run_script_from_command("M400")
         forward = self._filament_detected
 
         # Reverse
-        gcode.run_script_from_command("G1 E-10 F2000")
+        gcode.run_script_from_command(f"G1 E{self.load_grab_reverse_distance} F2000")
         gcode.run_script_from_command("M400")
         reverse = self._filament_detected
 
