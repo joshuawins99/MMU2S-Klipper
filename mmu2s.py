@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import serial
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 MMU_register_table = {
     "pulley_slow_feedrate"  : 0x14,
@@ -305,19 +308,153 @@ class MMU2S:
             return None
         return translate_status(resp)
 
+class MMU2S_Direct:
+    def __init__(self, printer):
+        self.printer = printer
+        self.reactor = printer.get_reactor()
+        self.mcu = printer.lookup_object("mcu")
+
+        self._rx_buffer = bytearray()
+        self.mmu_write = None
+        self.mmu_read = None
+
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
+
+    def handle_connect(self):
+        cq = self.mcu.alloc_command_queue()
+        self.mmu_write = self.mcu.lookup_command("mmu_write data=%*s", cq=cq)
+        self.mmu_read = self.mcu.lookup_query_command("mmu_read max=%c", "mmu_read_response data=%*s count=%u overflow=%u", cq=cq)
+
+    # ------------------------------------------------------------------
+    # UART RX
+    # ------------------------------------------------------------------
+    def _read_bytes(self, maxlen=64):
+        try:
+            resp = self.mmu_read.send([maxlen])
+        except Exception:
+            # No response → treat as empty
+            return b""
+        hexdata = resp["data"]
+        #logger.info("MMU UART RX MSG: count=%d data=%r overflow=%d", resp["count"], bytes.fromhex(hexdata.decode()), resp["overflow"])
+        return bytes.fromhex(hexdata.decode())
+
+
+    def flush_input(self):
+        # Just drop buffered decoded bytes; don't query the MCU
+        self._rx_buffer.clear()
+
+    def send_frame(self, frame):
+        self.flush_input()
+
+        if isinstance(frame, str):
+            frame = frame.encode("ascii")
+
+        self.mmu_write.send([frame])
+        self.reactor.pause(self.reactor.monotonic() + 0.020)
+
+    # ------------------------------------------------------------------
+    # Line + protocol
+    # ------------------------------------------------------------------
+    def _get_line(self):
+        while True:
+            newline = self._rx_buffer.find(b"\n")
+
+            if newline >= 0:
+                line = bytes(self._rx_buffer[:newline + 1])
+                del self._rx_buffer[:newline + 1]
+                return line.decode("ascii", errors="ignore")
+
+            data = self._read_bytes(64)
+
+            if data:
+                self._rx_buffer.extend(data)
+                continue
+
+            return None
+
+    def _wait_response(self, timeout=2.0):
+        end = self.reactor.monotonic() + timeout
+
+        while self.reactor.monotonic() < end:
+            line = self._get_line()
+
+            if line is not None:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                rsp = decode_response(line)
+
+                if rsp is not None:
+                    return rsp
+
+            self.reactor.pause(self.reactor.monotonic() + 0.005)
+
+        return None
+    # ------------------------------------------------------------------
+    # MMU protocol
+    def request(self, code_char, value=0, retries=3, wait_for_response=True):
+        frame = encode_request(code_char, value)
+
+        if wait_for_response == True:
+            for attempt in range(retries):
+                self.send_frame(frame)
+                response = self._wait_response()
+
+                if isinstance(response, MMUResponse) or code_char == 'X':
+                    return response
+
+                self.reactor.pause(
+                    self.reactor.monotonic() + 0.05
+                )
+        else:
+            self.send_frame(frame)
+
+        return None
+
+    def write_register(self, addr, value):
+        frame = encode_write_request(addr, value)
+        self.send_frame(frame)
+        return self._wait_response()
+
+    def read_register(self, addr):
+        frame = encode_read_request(addr)
+        self.send_frame(frame)
+        resp = self._wait_response()
+        if resp is None or resp.param_code != 'A':
+            return None
+        return resp.param_value
+
+    def read_register_retry(self, addr, attempts=3):
+        for _ in range(attempts):
+            val = self.read_register(addr)
+            if val is not None:
+                return val
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        return None
+
+    def get_status(self):
+        resp = self.request('Q', 0)
+        if not isinstance(resp, MMUResponse):
+            return None
+        return translate_status(resp)
+
 class MMUFindaSensor:
     def __init__(self, printer, mmu, poll_rate):
         self.printer = printer
+        self.reactor = self.printer.get_reactor()
         self.mmu = mmu
         self.state = False
         self.poll_rate = poll_rate
         self.enabled = False
+        self._poll_timer = None
 
-        self.reactor = printer.get_reactor()
-        self.reactor.register_timer(
-            self._poll,
-            self.reactor.monotonic() + 0.002
-        )
+        # Wait until MMU transport is ready
+        printer.register_event_handler("klippy:ready", self._start_polling)
+
+    def _start_polling(self):
+        self._poll_timer = self.reactor.register_timer(self._poll, self.reactor.monotonic() + 0.1)
 
     def _poll(self, eventtime):
         status = self.mmu.get_status()
@@ -338,6 +475,7 @@ class MMU2S_Klipper:
         self.reactor = self.printer.get_reactor()
 
         # Defined variables in klipper instantiation
+        connection_method               = config.get('connection_method', "Serial") # Native or Serial
         port                            = config.get('serial')
         baud                            = config.getint('baud', 115200)
         timeout                         = config.getfloat('timeout', 1.0)
@@ -361,31 +499,14 @@ class MMU2S_Klipper:
         self.mmu_cutter                 = config.getboolean('mmu_cutter', False) # Toggles use of MMU cutter for loading retries
 
         # Instantiate MMU2S driver
-        self.mmu = MMU2S(port=port, baud=baud, timeout=timeout)
-
-        if self.mmu_restart == True:
-            self.mmu.request('X', 0)
-        time.sleep(1)
-        # Hack to initialize comms
-        self.mmu.request('Q', 0)
-        self.mmu.request('Q', 0)
-        self.mmu.request('Q', 0)
+        if connection_method == "Native":
+            self.mmu = MMU2S_Direct(self.printer)
+        else:
+            self.mmu = MMU2S(port=port, baud=baud, timeout=timeout)
 
         self.changing_spools = False
         self.fail_counter = 0
         self.max_fail_count = 3
-
-        if self.mmu_slow_feedrate != 0: # Write register to update slow feedrate of MMU
-            self.mmu.write_register(MMU_register_table['pulley_slow_feedrate'], self.mmu_slow_feedrate)
-
-        if self.mmu_load_feedrate != 0: # Write register to update load feedrate of MMU
-            self.mmu.write_register(MMU_register_table['pulley_load_feedrate'], self.mmu_load_feedrate)
-
-        if self.mmu_bowden_length != 0: # Write register to update bowden length of MMU
-            self.mmu.write_register(MMU_register_table['bowden_length'], self.mmu_bowden_length)
-
-        if self.mmu_cut_length != 0: # Write register to update cut length of MMU
-            self.mmu.write_register(MMU_register_table['cut_length'], self.mmu_cut_length)
 
         gcode = self.printer.lookup_object('gcode')
 
@@ -398,10 +519,10 @@ class MMU2S_Klipper:
         gcode.register_command('MMU_RESET', self.cmd_MMU_RESET)
         gcode.register_command('MMU_SET_SPOOLJOIN', self.cmd_MMU_SET_SPOOLJOIN)
 
-        self.printer.add_object("filament_switch_sensor MMU_Finda", MMUFindaSensor(self.printer, self.mmu, self.FINDA_poll_rate))
-
         self.printer.register_event_handler("klippy:ready", self._spooljoin_handler)
-        self.printer.register_event_handler("klippy:ready", self._initialize_vars)
+        self.printer.register_event_handler("klippy:ready", self._mmu_ready)
+
+        self.printer.add_object("filament_switch_sensor MMU_Finda", MMUFindaSensor(self.printer, self.mmu, self.FINDA_poll_rate))
 
         #reactor = self.printer.get_reactor()
         #self._poll_timer = reactor.register_timer(self._poll_mmu)
@@ -409,8 +530,37 @@ class MMU2S_Klipper:
         #self.printer.register_event_handler("klippy:ready", self.handle_ready)
         #self.handle_ready()
 
-    def _initialize_vars(self):
+    def _mmu_ready(self):
         self.reactor.register_callback(self._run_initialization_gcode)
+        self.reactor.register_callback(self._init_mmu_ready)
+
+    def _init_mmu_ready(self, eventtime):
+        if self.mmu_restart:
+            self.mmu.request('X', 0)
+
+        self.reactor.pause(self.reactor.monotonic() + 0.5)
+
+        # Prime the status channel
+        self.mmu.request('Q', 0)
+        self.mmu.request('Q', 0)
+        self.mmu.request('Q', 0)
+
+        # Apply register overrides
+        if self.mmu_slow_feedrate:
+            self.mmu.write_register(MMU_register_table['pulley_slow_feedrate'],
+                                    self.mmu_slow_feedrate)
+
+        if self.mmu_load_feedrate:
+            self.mmu.write_register(MMU_register_table['pulley_load_feedrate'],
+                                    self.mmu_load_feedrate)
+
+        if self.mmu_bowden_length:
+            self.mmu.write_register(MMU_register_table['bowden_length'],
+                                    self.mmu_bowden_length)
+
+        if self.mmu_cut_length:
+            self.mmu.write_register(MMU_register_table['cut_length'],
+                                    self.mmu_cut_length)        
 
     def _run_initialization_gcode(self, eventtime):
         gcode = self.printer.lookup_object("gcode")
@@ -563,7 +713,6 @@ class MMU2S_Klipper:
             gcmd.respond_info(f"MMU: Loading attempts failed! Run MMU_RESET to clear error count")
 
     def _filament_sensor_check(self, eventtime):
-        reactor = self.printer.get_reactor()
         sensor = self.printer.lookup_object("filament_switch_sensor fsensor")
 
         self._filament_detected = sensor.get_status(eventtime).get("filament_detected", False)
@@ -571,6 +720,12 @@ class MMU2S_Klipper:
         if self._filament_detected:
             self.mmu.request('f', 1, wait_for_response=False)
             self._filament_sensor_triggered = True
+
+            if self._filament_sensor_timer is not None:
+                self.reactor.update_timer(self._filament_sensor_timer, self.reactor.NEVER)
+                self._filament_sensor_timer = None
+
+            return self.reactor.NEVER
 
         return eventtime + 0.001
 
@@ -659,8 +814,6 @@ class MMU2S_Klipper:
             else:
                 gcmd.respond_info(f"MMU: Filament not detected after {self.load_total_distance} mm.")
                 #self._pause_print()
-                # Tell MMU filament sensor activated to stop motor grinding
-                self.mmu.request('f', 1)
                 while True:
                     status = self.mmu.get_status()
                     if status['status'] == 'Finished' or status['value'] == 0:
@@ -676,6 +829,8 @@ class MMU2S_Klipper:
                 loading_failed = True
 
             if loading_failed == True:
+                # Tell MMU filament sensor activated to stop motor grinding
+                self._filament_detected = True
                 self.fail_counter += 1
                 gcode.run_script_from_command(f"MMU_UNLOAD")
                 return False
