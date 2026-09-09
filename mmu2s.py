@@ -483,10 +483,11 @@ class MMU2S_Klipper:
         self.load_step                  = config.getfloat('load_step', 5.0) # Used as a granularity amount for gcode commands send to extruder motor while waiting for filament to arrive
         self.load_extra_pull            = config.getfloat('load_extra_pull', 5.0) # Extra amount to pull filament in after filament detected from a load
         self.load_extra_retract         = config.getfloat('load_extra_retract', -30.0) # Amount to retract filament after extra pull. If extra_pull is 0 then this is ignored. 
-        self.load_slow_feedrate         = config.getint('load_slow_feedrate', 0) # Feedrate of the extruder motor to pull filament in. 0 reads MMU register to match it. In mm/s
+        self.load_slow_feedrate         = config.getfloat('load_slow_feedrate', 0) # Feedrate of the extruder motor to pull filament in. 0 reads MMU register to match it. In mm/s
         self.load_feedrate_factor       = config.getfloat('load_feedrate_factor', 1) # Multiplier for during MMU to extruder handoff
         self.load_grab_forward_distance = config.getfloat('load_grab_forward_distance', 20.0) # Distance to pull the filament in for the grab test
         self.load_grab_reverse_distance = config.getfloat('load_grab_reverse_distance', -12.0) # Distance to retract the filament out for the grab test
+        self.load_grab_speed            = config.getfloat('load_grab_speed', 50.0) # Speed at which the filament is loaded and unloaded for grab test
         self.unload_retract_speed       = config.getfloat('unload_retract_speed', 20.0) # Initial extruder retraction speed on an unload from extruder
         self.unload_step                = config.getfloat('unload_step', 2.0) # Used as a granularity amount for gcode commands send to extruder motor while waiting for filament sensor to deactivate
         self.unload_max_retract         = config.getfloat('unload_max_retract', 30.0) # Used as a timeout for filament to unload from extruder
@@ -729,28 +730,61 @@ class MMU2S_Klipper:
 
         return eventtime + 0.001
 
+    def _start_async_fsensor_sampling(self):
+        reactor = self.printer.get_reactor()
+        sensor = self.printer.lookup_object("filament_switch_sensor fsensor")
+
+        # Storage for readings
+        self._grab_test_samples = []
+        self._grab_test_active = True
+
+        def _sample(eventtime):
+            if not self._grab_test_active:
+                return reactor.NEVER
+
+            reading = sensor.get_status(eventtime).get("filament_detected", False)
+            self._grab_test_samples.append(reading)
+
+            # Poll every 1ms
+            return eventtime + 0.001
+
+        # Register timer
+        self._grab_test_timer = reactor.register_timer(_sample, reactor.monotonic() + 0.001)
+
+    def _stop_async_fsensor_sampling(self):
+        reactor = self.printer.get_reactor()
+
+        # Stop timer
+        self._grab_test_active = False
+        if self._grab_test_timer is not None:
+            reactor.update_timer(self._grab_test_timer, reactor.NEVER)
+            self._grab_test_timer = None
+
+        # Evaluate: fail if any sample is False
+        return all(self._grab_test_samples)
+
+
     def _check_filament_grab(self, gcmd):
         reactor = self.printer.get_reactor()
         gcode = self.printer.lookup_object("gcode")
-        sensor = self.printer.lookup_object("filament_switch_sensor fsensor")
+        feedrate = self.load_grab_speed * 60.0
 
-        initial = sensor.get_status(reactor.monotonic()).get("filament_detected", False)
-        self._filament_detected = initial
+        self._start_async_fsensor_sampling()
 
         # Forward
-        gcode.run_script_from_command(f"G1 E{self.load_grab_forward_distance} F2000")
+        gcode.run_script_from_command(f"G1 E{self.load_grab_forward_distance} F{feedrate:.0f}")
         gcode.run_script_from_command("M400")
-        forward = self._filament_detected
 
         # Reverse
-        gcode.run_script_from_command(f"G1 E{self.load_grab_reverse_distance} F2000")
+        gcode.run_script_from_command(f"G1 E{self.load_grab_reverse_distance} F{feedrate:.0f}")
         gcode.run_script_from_command("M400")
-        reverse = self._filament_detected
 
-        gcmd.respond_info(f"MMU: Grab Test -> initial={initial}, forward={forward}, reverse={reverse}")
+        passed = self._stop_async_fsensor_sampling()
+
+        gcmd.respond_info(f"MMU: Grab Test -> samples={len(self._grab_test_samples)}, passed={passed}")
 
         # Filament should have always triggered sensor
-        return (initial and forward and reverse)
+        return passed
 
     def _start_loading(self, gcmd, slot):
         gcode = self.printer.lookup_object("gcode")
@@ -784,7 +818,6 @@ class MMU2S_Klipper:
                     if self._filament_sensor_timer is not None:
                         reactor.update_timer(self._filament_sensor_timer, reactor.NEVER)
                         self._filament_sensor_timer = None
-                    gcode.run_script_from_command(f"G4 P1500")
                     while True: # Wait until completed to finish loading
                         status = self.mmu.get_status()
                         if status['status'] == 'Finished' or status['value'] == 0:
@@ -794,9 +827,10 @@ class MMU2S_Klipper:
                             gcmd.respond_info(f"MMU: Loading Error -> {error_name}")
                             self._pause_print()
                             break
+                        gcode.run_script_from_command(f"G1 E1 F{3.3*60.0}")
+                        gcode.run_script_from_command("M400")
                         reactor.pause(reactor.monotonic() + 0.002)
-                    gcode.run_script_from_command(f"G1 E1 F{feedrate:.0f}")
-                    gcode.run_script_from_command(f"M400")
+                    gcode.run_script_from_command(f"G4 P2000")
                     if not self._check_filament_grab(gcmd):
                         gcmd.respond_info(f"MMU: Loading Error -> Didnt Pass Grab Test")
                         loading_failed = True
