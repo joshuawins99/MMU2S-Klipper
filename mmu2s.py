@@ -6,15 +6,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 MMU_register_table = {
-    "pulley_slow_feedrate"  : 0x14,
-    "pulley_load_feedrate"  : 0x11,
-    "FINDA_State"           : 0x08,
-    "FSensor_State"         : 0x09,
-    "Filament_State"        : 0x07,
-    "Set_Get_Selector_slot" : 0x1b,
-    "Set_Get_Idler_slot"    : 0x1c,
-    "bowden_length"         : 0x22,
-    "cut_length"            : 0x23
+    "Filament_State"           : 0x07,
+    "FINDA_State"              : 0x08,
+    "FSensor_State"            : 0x09,
+    "Motor_Mode"               : 0x0a,
+    "pulley_load_feedrate"     : 0x11,
+    "pulley_slow_feedrate"     : 0x14,
+    "Set_Get_Selector_slot"    : 0x1b,
+    "Set_Get_Idler_slot"       : 0x1c,
+    "Set_Get_Pulley_current"   : 0x1e,
+    "Set_Get_Selector_current" : 0x1f,
+    "Set_Get_Idler_current"    : 0x20,
+    "bowden_length"            : 0x22,
+    "cut_length"               : 0x23
 }
 
 MMU_status_table = {
@@ -494,6 +498,9 @@ class MMU2S_Klipper:
         self.FINDA_poll_rate            = config.getfloat('FINDA_poll_rate', 1) # Polling rate of FINDA probe
         self.mmu_slow_feedrate          = config.getint('mmu_slow_feedrate', 0) # Allows for writing MMU register to change slow_feedrate. 0 means use default
         self.mmu_load_feedrate          = config.getint('mmu_load_feedrate', 0) # Allows for writing MMU register to change load_feedrate. 0 means use default
+        self.mmu_pulley_current         = config.getint('mmu_pulley_current', -1) # Allows for writing MMU register to change pulley_current. -1 means use default
+        self.mmu_selector_current       = config.getint('mmu_selector_current', -1) # Allows for writing MMU register to change selector_current. -1 means use default
+        self.mmu_idler_current          = config.getint('mmu_idler_current', -1) # Allows for writing MMU register to change idler_current. -1 means use default
         self.mmu_bowden_length          = config.getint('mmu_bowden_length', 0) # Allows for writing MMU register to change bowden_length. 0 means use default
         self.mmu_cut_length             = config.getint('mmu_cut_length', 0) # Allows for writing MMU register to change cut_length. 0 means use default
         self.mmu_restart                = config.getboolean('mmu_restart', True) # Toggles MMU restarting when Klipper initializes
@@ -548,20 +555,25 @@ class MMU2S_Klipper:
 
         # Apply register overrides
         if self.mmu_slow_feedrate:
-            self.mmu.write_register(MMU_register_table['pulley_slow_feedrate'],
-                                    self.mmu_slow_feedrate)
+            self.mmu.write_register(MMU_register_table['pulley_slow_feedrate'], self.mmu_slow_feedrate)
 
         if self.mmu_load_feedrate:
-            self.mmu.write_register(MMU_register_table['pulley_load_feedrate'],
-                                    self.mmu_load_feedrate)
+            self.mmu.write_register(MMU_register_table['pulley_load_feedrate'], self.mmu_load_feedrate)
 
         if self.mmu_bowden_length:
-            self.mmu.write_register(MMU_register_table['bowden_length'],
-                                    self.mmu_bowden_length)
+            self.mmu.write_register(MMU_register_table['bowden_length'], self.mmu_bowden_length)
 
         if self.mmu_cut_length:
-            self.mmu.write_register(MMU_register_table['cut_length'],
-                                    self.mmu_cut_length)        
+            self.mmu.write_register(MMU_register_table['cut_length'], self.mmu_cut_length)      
+
+        if self.mmu_pulley_current != -1:
+            self.mmu.write_register(MMU_register_table['Set_Get_Pulley_current'], self.mmu_pulley_current) 
+
+        if self.mmu_selector_current != -1:
+            self.mmu.write_register(MMU_register_table['Set_Get_Selector_current'], self.mmu_selector_current) 
+
+        if self.mmu_idler_current != -1:
+            self.mmu.write_register(MMU_register_table['Set_Get_Idler_current'], self.mmu_idler_current) 
 
     def _run_initialization_gcode(self, eventtime):
         gcode = self.printer.lookup_object("gcode")
@@ -712,6 +724,7 @@ class MMU2S_Klipper:
 
         if self.fail_counter >= self.max_fail_count:
             gcmd.respond_info(f"MMU: Loading attempts failed! Run MMU_RESET to clear error count")
+            self._pause_print()
 
     def _filament_sensor_check(self, eventtime):
         sensor = self.printer.lookup_object("filament_switch_sensor fsensor")
@@ -1061,6 +1074,15 @@ class MMU2S_Klipper:
 
         if self.mmu_cut_length != 0: # Write register to update cut length of MMU
             self.mmu.write_register(MMU_register_table['cut_length'], self.mmu_cut_length)
+
+        if self.mmu_pulley_current != -1: # Write register to update pulley current of MMU
+            self.mmu.write_register(MMU_register_table['Set_Get_Pulley_current'], self.mmu_pulley_current)
+
+        if self.mmu_selector_current != -1: # Write register to update selector current of MMU
+            self.mmu.write_register(MMU_register_table['Set_Get_Selector_current'], self.mmu_selector_current) 
+
+        if self.mmu_idler_current != -1: # Write register to update idler current of MMU
+            self.mmu.write_register(MMU_register_table['Set_Get_Idler_current'], self.mmu_idler_current) 
 
     def save_spooljoin(self, spool_list):
         sv = self.printer.lookup_object("save_variables")
