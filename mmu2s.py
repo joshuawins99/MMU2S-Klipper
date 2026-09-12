@@ -544,8 +544,10 @@ class MMU2S_Klipper:
         if self.mmu_load_feedrate != 0: # Write register to update load feedrate of MMU
             self.mmu.write_register(MMU_register_table['pulley_load_feedrate'], self.mmu_load_feedrate)
 
-        if self.mmu_bowden_length != 0: # Write register to update bowden length of MMU
+        if self.mmu_bowden_length != 0 and self.mmu.read_register_retry(MMU_register_table["bowden_length"]) != self.mmu_bowden_length: # Write register to update bowden length of MMU
             self.mmu.write_register(MMU_register_table['bowden_length'], self.mmu_bowden_length)
+        elif self.mmu_bowden_length == 0 and self.mmu.read_register_retry(MMU_register_table["bowden_length"]) != 360: # Set default value
+            self.mmu.write_register(MMU_register_table['bowden_length'], 360)
 
         if self.mmu_cut_length != 0: # Write register to update cut length of MMU
             self.mmu.write_register(MMU_register_table['cut_length'], self.mmu_cut_length)
